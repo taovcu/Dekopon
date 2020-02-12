@@ -1,0 +1,906 @@
+#!/usr/local/bin/python3.7
+# On Linux, run 'which python3.7' to get this path
+
+import os
+import platform
+import hashlib
+
+import ety
+
+import tkinter
+from tkinter import *
+from tkinter import ttk
+import tkinter.scrolledtext as tkst
+
+import pytesseract
+from PIL import Image
+from wand.image import Image as WImage
+
+from PyPDF2 import PdfFileReader
+
+import Helpers.text2speech as TTS
+from tkinter import messagebox
+from tkinter import filedialog
+
+import eng_to_ipa as ipa
+import time
+import datetime
+import string
+
+import multiprocessing
+import threading
+
+import wikipedia
+import difflib
+from difflib import SequenceMatcher
+
+from nltk.corpus import wordnet
+ 
+from pydrive.auth import GoogleAuth
+from pydrive.drive import GoogleDrive
+
+import settings
+
+import requests
+import shutil
+
+import language_check
+tool = language_check.LanguageTool('en-US')
+
+if settings.google_drv == 1:
+    gauth = GoogleAuth()
+    # Try to load saved client credentials
+    gauth.LoadCredentialsFile("mycreds.txt")
+    if gauth.credentials is None:
+        # Authenticate if they're not there
+        gauth.LocalWebserverAuth()
+    elif gauth.access_token_expired:
+        # Refresh them if expired
+        gauth.Refresh()
+    else:
+        # Initialize the saved creds
+        gauth.Authorize()
+    # Save the current credentials to a file
+    gauth.SaveCredentialsFile("mycreds.txt")
+    drive = GoogleDrive(gauth)
+
+
+if settings.google_map == 1:
+    try:
+        with open('gmap_api_key.txt', 'r') as fh:
+            map_api_key = fh.read()
+            # Store configuration file values
+    except FileNotFoundError:
+        # Keep preset values
+        print("File gmap_api_key.txt is not in working directory. Program Exit!")
+
+
+SupportedImageTypes = ['.jpg', '.gif', '.png']
+
+try:
+    from colorama import Fore, Back, Style, init
+    init()
+except ImportError:  # fallback so that the imported classes always exist
+    class ColorFallback():
+        __getattr__ = lambda self, name: ''
+    Fore = Back = Style = ColorFallback()
+
+def md5(fname):
+    hash_md5 = hashlib.md5()
+    with open(fname, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
+def gmap(c):
+    pngfilename = '.metadata/' + c + '.png'
+    giffilename = '.metadata/' + c + '.gif'
+    if os.path.isfile(giffilename):
+        return PhotoImage(file = giffilename)
+
+    # url variable store url 
+    url = "https://maps.googleapis.com/maps/api/staticmap?"
+    # map image at city level
+    zoom = 10
+    # return response object 
+    r = requests.get(url, "center=" + c + "&zoom=" +
+                     str(zoom) + "&size=640x640" + "&key=" +
+                     map_api_key + "&sensor=false", stream=True)
+
+    if r.status_code == 200:
+        with open(pngfilename, 'wb') as f:
+            r.raw.decode_content = True
+            shutil.copyfileobj(r.raw, f)
+    else:
+        print("requests get error with status_code".format(r.status_code))
+        return
+
+    os.system("convert {} {}".format(pngfilename, giffilename))
+    return PhotoImage(file = giffilename)
+
+
+def color_diff(s1, s2):
+    diff = ''.join(difflib.ndiff(s1, s2))
+    if diff.startswith('+'):
+        return Fore.GREEN + diff + Fore.RESET
+    elif diff.startswith('-'):
+        return Fore.RED + diff + Fore.RESET
+    elif diff.startswith('^'):
+        return Fore.BLUE + diff + Fore.RESET
+    else:
+        return diff
+
+def splitfile(fname, s):
+    filename, file_extension = os.path.splitext(fname)
+    lines_per_file = s
+    smallfile = None
+    smallfiles = []
+    with open(fname) as bigfile:
+        for lineno, line in enumerate(bigfile):
+            if lineno % lines_per_file == 0:
+                small_filename = filename + '_{0:0=4d}'.format((int)(lineno / lines_per_file))
+                smallfiles.append(small_filename)
+                if smallfile:
+                    smallfile.close()
+                smallfile = open(small_filename, "w")
+            smallfile.write(line)
+        if smallfile:
+            smallfile.close()
+    return smallfiles
+
+def readrange(fd, n1, n2):
+    content = ''
+    fd.seek(0)
+    for i in range(n1):
+        fd.readline()
+    for i in range(n2 - n1):
+        content += fd.readline()
+    return content
+
+def resizeimg(imgfilepath):
+    img = Image.open(imgfilepath).convert('P')
+    basewidth = 900
+    if platform.system() == 'Linux':
+        basewidth = 1150
+    wpercent = (basewidth/float(img.size[0]))
+    if wpercent < 1:
+        hsize = int((float(img.size[1])*float(wpercent)))
+        img = img.resize((basewidth, hsize), Image.ANTIALIAS)
+        # imgfile not necessarily gif
+        imgfilepath = os.path.splitext(imgfilepath)[0] + '.gif'
+        img.save(imgfilepath)
+
+def pdfpage2gif(pdfpath, gifpath, n):
+    os.system("convert -density 200 {}[{}] -flatten -fuzz 1% -trim +repage {}".format(pdfpath, n, gifpath))
+
+class ResizableWindow(Frame):
+    def __init__(self, parent, name='dekopon'):
+        Frame.__init__(self, name=name)
+        self.parent = parent
+        self.master.title('Dekopon')
+
+        self.update()
+        self.filetype = None
+        self.imgfilepath = None
+        self.filepath = filedialog.askopenfilename(title = "Select a file", filetypes = (("image files", ("*.jpg", "*.gif", "*.png")), ("Text files","*.txt"), ("pdf files","*.pdf")))
+        if not self.filepath:
+            sys.exit()
+
+        filename, file_extension = os.path.splitext(self.filepath)
+
+        self.alllastread = dict()
+        self.filemd5 = md5(self.filepath)
+
+        self.currentpage = 0
+        self.totalpages = 1
+        self.pagetoprepare = 0
+        self.direction = 1
+        self.page_thread = None
+        self.ttsthread = None
+        self.page_thread_stop = 0
+        self.p = {}
+        self.t = {}
+        self.pagelabel = StringVar()
+
+        self.notesDirty = 0
+        self.vocabularyBookDirty = 0
+        self.memorizeflag = 0
+        self.savedmsg = None
+      
+        if not os.path.exists('.metadata'):
+            try:
+                os.makedirs('.metadata')
+            except:
+                print('.metadata folder cannot be created')
+                sys.exit()
+
+        self.vocabularyBook = open(".metadata/vocabularyBook.txt", "a")
+        self.vocabularyBookRead = open(".metadata/vocabularyBook.txt", "r")
+        self.notes = open(".metadata/notes.txt", "a")
+        self.notesRead = open(".metadata/notes.txt", "r")
+
+        self.newwordset = set()
+
+        self.f1_style = ttk.Style()
+        self.f1_style.configure('My.TFrame', background='#334353')
+        self.f1 = ttk.Frame(self.parent, style='My.TFrame', padding=(3, 3, 3, 3))  # added padding
+
+
+        self.f1.grid(column=0, row=0, sticky=(N, S, E, W))  # added sticky
+         # create the notebook
+        nb = ttk.Notebook(self.f1, name='notebook')
+        nb.grid(column=0, row=0, rowspan=2, columnspan=2, sticky='new')
+
+        frame_button = Frame(self.f1, name='button')
+        frame_button.grid(column=0, row=2, rowspan=1, columnspan=2, sticky='new')
+
+        self.previmg = PhotoImage(file="symbols/prevpage.gif")
+        left_button = ttk.Button(frame_button, image = self.previmg, text='Prev Page', state=NORMAL, command=self.prev_page)
+        self.jumpimg = PhotoImage(file="symbols/jump.gif")
+        jump_button = ttk.Button(frame_button, image = self.jumpimg, text='Go to Page', state=NORMAL, command = lambda: self.jump_to_page(int(self.page_num.get())))
+
+        self.page_num = Entry(frame_button, textvariable = self.pagelabel, width=8, justify='center')
+
+        self.nextimg = PhotoImage(file="symbols/nextpage.gif")
+        right_button = ttk.Button(frame_button, image = self.nextimg, text='Next Page', state=NORMAL, command=self.next_page)
+        left_button.grid(row=0, column=0, rowspan = 3, pady=20, padx = 150)
+        jump_button.grid(row=1, column=1)
+        self.page_num.grid(row=2, column=1)
+        right_button.grid(row=0, column=2, rowspan = 3, padx=150)
+
+        frame_image = Frame(nb, name='image')
+        wd = 125
+        if platform.system() == 'Linux':
+            wd = 165
+        self.lbimage = Text(frame_image, width=wd, height =60)
+        self.lbimage.grid(row=0, column=0, rowspan=2, columnspan=2,  sticky='new', pady=5)
+
+        frame_text = Frame(nb, name='text')
+        self.lbtext = Text(frame_text, width=90, height =60, font=("Courier", 16), undo=True)
+        self.lbtext.grid(row=0, column=0, rowspan=2, columnspan=2, sticky='new', pady=5)
+
+        nb.add(frame_image, underline=0, padding=2, text = 'Image')
+        nb.add(frame_text, underline=0, padding=2, text = 'Text')
+
+
+        # Google drive is employed to store vocabulary and note books
+        if settings.google_drv == 1:
+            self.notesid = None
+            self.newwordsid = None
+            self.lastreadid = None
+            self.notesgf = None
+            self.newwordsgf = None
+            self.lastreadgf = None
+            file_list = drive.ListFile({'q': "'root' in parents and trashed=false"}).GetList()
+            for file1 in file_list:
+                if file1['title'] == 'Dekopon/lastread.txt':
+                    self.lastreadid = file1['id']
+                    self.lastreadgf = drive.CreateFile({'id' : self.lastreadid})
+                    # book read records always in memory
+                    content = self.lastreadgf.GetContentString()
+                    # build a dict to maintain lastread info
+                    lines = content.splitlines()
+                    for l in lines:
+                        bookid, pagenum = l.split(':')
+                        self.alllastread[bookid] = pagenum
+
+                if file1['title'] == 'Dekopon/notes.txt':
+                    self.notesid = file1['id']
+                    self.notesgf = drive.CreateFile({'id' : self.notesid})
+                    # sync up cloud notes to local file
+                    content = self.notesgf.GetContentString()
+                    self.notes.write(content)
+                    self.notes.flush()
+
+                if file1['title'] == 'Dekopon/vocabularyBook.txt':
+                    self.newwordsid = file1['id']
+                    self.newwordsgf = drive.CreateFile({'id' : self.newwordsid})
+                    # sync up cloud words to local file
+                    content = self.newwordsgf.GetContentString()
+                    self.vocabularyBook.write(content)
+                    self.vocabularyBook.flush()
+                    # build a set to avoid adding existing words
+                    lines = content.splitlines()
+                    for l in lines:
+                        w = l.split('[')[0].split()
+                        if w and w[0] not in self.newwordset:
+                            self.newwordset.add(w[0])
+
+            if not self.lastreadgf:
+                self.lastreadgf = drive.CreateFile({'title' : 'Dekopon/lastread.txt'})
+                self.lastreadgf.Upload()
+                self.lastreadid = self.lastreadgf['id']
+
+            if not self.notesgf:
+                self.notesgf = drive.CreateFile({'title' : 'Dekopon/notes.txt'})
+                self.notesgf.Upload()
+                self.notesid = self.notesgf['id']
+
+            if not self.newwordsgf:
+                self.newwordsgf = drive.CreateFile({'title' : 'Dekopon/vocabularyBook.txt'})
+                self.newwordsgf.Upload()
+                self.newwordsid = self.newwordsgf['id']
+
+            if self.filemd5 in self.alllastread:
+                self.currentpage = int(self.alllastread[self.filemd5])
+
+            self.autosync_stop = 0
+            self.autosync_thread = threading.Thread(target=self.autocloudfilesync, args=())
+            self.autosync_thread.start()
+
+
+        if file_extension == '.txt':
+            self.filetype = 'txt'
+            self.BookRead = open(self.filepath, "r")
+            #self.textfiles = splitfile(self.filepath, 30)
+            self.totalpages = int(sum(1 for line in self.BookRead) / 30) + 1
+            self.pagelabel.set('{}/{}'.format(self.currentpage+1, self.totalpages))
+
+        if file_extension == '.pdf':
+            self.filetype = 'pdf'
+            self.fileimages = {}
+            self.pdf = PdfFileReader(open(self.filepath, 'rb'))
+            self.totalpages = self.pdf.getNumPages()
+
+            newfilename = os.path.splitext(self.filepath)[0] + "_{0:0=4d}".format(self.currentpage) + '.gif'
+            pdfpage2gif(self.filepath, newfilename, self.currentpage)
+
+            self.fileimages[self.currentpage] = newfilename
+            self.pagelabel.set('{}/{}'.format(self.currentpage+1, self.totalpages))
+
+        if file_extension in SupportedImageTypes:
+            self.filetype = 'image'
+            # resize image file
+            resizeimg(self.filepath)
+            self.imgfilepath = os.path.splitext(self.filepath)[0] + '.gif'
+
+
+        if self.filetype == 'image':
+            self.currentphoto = PhotoImage(file=self.imgfilepath)
+            self.lbimage.image_create(END, image = self.currentphoto)
+            self.lbimage.insert(END, '\n'*2)
+            self.fillpageend(self.lbimage)
+
+            t = pytesseract.image_to_string(Image.open(self.filepath).convert('P'), lang='eng')
+            self.lbtext.insert(END, t+'\n'*2)
+            self.fillpageend(self.lbtext)
+            self.pagelabel.set('{}/{}'.format(self.currentpage+1, self.totalpages))
+
+        if self.filetype == 'pdf':
+            t = pytesseract.image_to_string(Image.open(self.fileimages[self.currentpage]).convert('P'), lang='eng')
+            resizeimg(self.fileimages[self.currentpage])
+
+            self.page_thread = threading.Thread(target=self.prepare_pages, args=())
+            self.page_thread.start()
+
+            self.currentphoto = PhotoImage(file=self.fileimages[self.currentpage])
+            self.p[self.currentpage] = self.currentphoto
+            self.lbimage.image_create(END, image = self.currentphoto)
+            self.lbimage.insert(END, '\n'*2)
+            self.fillpageend(self.lbimage)
+            self.t[self.currentpage] = t
+            self.lbtext.insert(END, t)
+            self.lbtext.insert(END, '\n'*2)
+            self.fillpageend(self.lbtext)
+
+        if self.filetype == 'txt':
+            nb.forget(frame_image)
+            #self.BookRead = open(self.textfiles[self.currentpage], "r")
+            content = readrange(self.BookRead, 30 * self.currentpage, 30 * self.currentpage + 30)
+            self.lbtext.insert(END, content)
+            self.lbtext.insert(END, '\n'*2)
+            self.fillpageend(self.lbtext)
+
+        frame_button2 = Frame(self.f1, name='button2')
+        frame_button2.grid(column=2, row=0, rowspan=1, columnspan=3, sticky='new', padx = 5)
+
+        self.translateimg = PhotoImage(file="symbols/china.gif")
+        self.transbt = ttk.Button(frame_button2, image = self.translateimg, text="Translate", command=self.TransCallBack)
+        self.transbt.grid(column=0, row=0, columnspan=1, sticky=(W), padx = 5)  # added sticky, padx
+
+        self.ttsimg = PhotoImage(file="symbols/tts.gif")
+        self.text_speech = ttk.Button(frame_button2, image = self.ttsimg, text="TTS", command=self.TTSCallBack)
+        self.text_speech.grid(column=1, row=0)  # added sticky, padx
+
+        self.addwordsimg = PhotoImage(file="symbols/addwords.gif")
+        self.newwords_add = ttk.Button(frame_button2, image = self.addwordsimg, text="Add Words", command=self.newwordsAddCallBack)
+        self.newwords_add.grid(column=2, row=0, padx = 5)  # added sticky, padx
+
+        self.listwordsimg = PhotoImage(file="symbols/listwords.gif")
+        self.newwords_display = ttk.Button(frame_button2, image = self.listwordsimg, text="List Words", command=self.newwordsDisplayCallBack)
+        self.newwords_display.grid(column=3, row=0)  # added sticky, padx
+
+        self.syncimg = PhotoImage(file="symbols/sync.gif")
+        self.syncbt = ttk.Button(frame_button2, image = self.syncimg, text="Sync Files", command=self.cloudfilesync)
+        self.syncbt.grid(column=4, row=0)  # added sticky, padx
+
+        self.synonymimg = PhotoImage(file="symbols/synonym.gif")
+        self.Synonymbt = ttk.Button(frame_button2, image = self.synonymimg, text="Synonym", command = self.SynonymCallBack)
+        self.Synonymbt.grid(column=0, row=1, padx = 5)  # added sticky, padx
+
+        self.wikiimg = PhotoImage(file="symbols/wiki.gif")
+        self.wikibt = ttk.Button(frame_button2, image = self.wikiimg, text="WIKI", command = self.wikiCallBack)
+        self.wikibt.grid(column=1, row=1)  # added sticky, padx
+
+        self.addnotesimg = PhotoImage(file="symbols/addnotes.gif")
+        self.addnotesbt = ttk.Button(frame_button2, image = self.addnotesimg, text="Add Notes", command = self.addnotesCallBack)
+        self.addnotesbt.grid(column=2, row=1, padx = 5)  # added sticky, padx
+        self.displaynotesimg = PhotoImage(file="symbols/displaynotes.gif")
+        self.displaynotesbt = ttk.Button(frame_button2, image = self.displaynotesimg, text="Show Notes", command = self.displaynotesCallBack)
+        self.displaynotesbt.grid(column=3, row=1)  # added sticky, padx
+
+        self.sttimg = PhotoImage(file="symbols/stt.gif")
+        self.sttbt = ttk.Button(frame_button2, image = self.sttimg, text="STT", command = self.sttCallBack)
+        self.sttbt.grid(column=4, row=1, padx = 5)  # added sticky, padx
+
+        self.memorizeimg = PhotoImage(file="symbols/memorize.gif")
+        self.memorizebt = ttk.Button(frame_button2, image = self.memorizeimg, text="memorize", command = self.memorizeCallBack)
+        self.memorizebt.grid(column=5, row=0)  # added sticky, padx
+
+        self.grammarcheckimg = PhotoImage(file="symbols/grammarcheck.gif")
+        self.grammarcheckbt = ttk.Button(frame_button2, image = self.grammarcheckimg, text="grammarcheck", command = self.GrammarCheckCallBack)
+        self.grammarcheckbt.grid(column=6, row=0, padx = 5)  # added sticky, padx
+
+
+        self.mapimg = PhotoImage(file="symbols/map.gif")
+        self.mapbt = ttk.Button(frame_button2, image = self.mapimg, text="map", command = self.mapCallBack)
+        self.mapbt.grid(column=5, row=1)  # added sticky, padx
+
+        self.transtxt = Text(self.f1, width=45, height =40, font=("Courier", 16))
+        self.transtxt.grid(column=2, row=1, columnspan=3, sticky=(N, W), pady=0, padx=5)  # added sticky, pady, padx
+
+        frame_button3 = Frame(self.f1, name='button3')
+        frame_button3.grid(column=2, row=2, rowspan=2, columnspan=3, sticky='new', padx = 5)
+        self.clearimg = PhotoImage(file="symbols/clear.gif")
+        self.clearbt = Button(frame_button3, text="Clear", command = self.cleartransCallBack, image = self.clearimg)
+        self.clearbt.grid(column=0, row=0, rowspan=2)  # added sticky, padx
+ 
+        # added resizing configs
+        self.parent.columnconfigure(0, weight=1)
+        self.parent.rowconfigure(0, weight=1)
+        self.f1.columnconfigure(0, weight=3)
+        self.f1.columnconfigure(1, weight=3)
+        self.f1.columnconfigure(2, weight=1)
+        self.f1.rowconfigure(1, weight=1)
+
+
+    def cleartransCallBack(self):
+        self.transtxt.delete(1.0, END)
+
+    def memorizeCallBack(self):
+        try:
+            msg = self.lbtext.selection_get()
+        except:
+            msg = None
+        if msg and self.memorizeflag == 0:
+            self.savedmsg = msg
+            self.rm_selected()
+            self.memorizeflag = 1
+        elif self.memorizeflag == 1:
+            self.undo_rm_selected()
+            userinput = self.transtxt.get("1.0", END)
+            self.transtxt.delete("1.0", END)
+            self.transtxt.insert(END, 'Orig: {}\n\nYour: {}'.format(self.savedmsg, userinput))
+            self.transtxt.insert(END, '\n\n Similarity: {}'.format(SequenceMatcher(None, self.savedmsg, userinput).ratio()))
+            self.memorizeflag = 0
+        else:
+            return
+        
+
+    def rm_selected(self):
+        self.lbtext.edit_separator()
+        try:
+            msg = self.lbtext.selection_get()
+        except TclError:
+            return ""
+        self.lbtext.delete("sel.first", "sel.last")
+
+    def undo_rm_selected(self):
+        self.lbtext.edit_undo()
+
+    def mapCallBack(self):
+        try:
+            msg = self.lbtext.selection_get()
+        except TclError:
+            return ""
+        msg = msg.replace(" ", "")
+        self.transtxt.delete(1.0, END)
+        self.mapimage = gmap(msg)
+        self.transtxt.image_create(END, image = self.mapimage)
+
+
+    def fillpageend(self, w):
+        self.endimage = PhotoImage(file="symbols/endfilling.gif")
+        w.image_create(END, image = self.endimage)
+
+
+    def addnotesCallBack(self):
+        try:
+            note = self.lbtext.selection_get()
+        except TclError:
+            pass
+        # self.transtxt is empty
+            note = self.transtxt.get("1.0", END)
+            if len(note) <= 1:
+                return
+
+        self.notesDirty = 1
+        self.notes.write("{} {}: \n\t{}\r\n\n".format(datetime.datetime.now(), self.filepath, note))
+        self.notes.flush()
+
+
+    def displaynotesCallBack(self):
+        self.notesRead.seek(0, 0)
+        content = self.notesRead.read()
+        self.transtxt.delete(1.0, END)
+        self.transtxt.insert(END, content)
+        self.transtxt.see(END)
+
+
+    def wikiCallBack(self):
+        try:
+            msg = self.lbtext.selection_get()
+        except TclError:
+            pass
+        try:
+            msg = self.transtxt.selection_get()
+        except TclError:
+            return
+        try:
+            wikitext = wikipedia.summary(msg)
+        except:
+            return
+        self.transtxt.delete(1.0, END)
+        try:
+            self.transtxt.insert(END, 'WIKI of {}:\n \t{}'.format(msg, wikitext))
+        except TclError:
+            return
+
+    def SynonymCallBack(self):
+        try:
+            msg = self.lbtext.selection_get()
+        except TclError:
+            pass
+        try:
+            msg = self.transtxt.selection_get()
+        except TclError:
+            return ""
+        synwords = []
+        antwords = []
+        synonyms = wordnet.synsets(msg)
+        for syn in synonyms:
+            for l in syn.lemmas():
+                synwords.append(l.name())
+                if l.antonyms():
+                    antwords.append(l.antonyms()[0].name())
+        try:
+            etymology = ety.tree(msg).__str__()
+        except:
+            etymology = ''
+
+        self.transtxt.delete(1.0, END)
+        self.transtxt.insert(END, 'SYNNONYMS of {}:\n \t{}\n\n'.format(msg, set(synwords)))
+        self.transtxt.insert(END, 'ANTONYMS of {}:\n \t{}\n\n'.format(msg, set(antwords)))
+        self.transtxt.insert(END, 'ETYMOLOGY of {}:\n{}'.format(msg, etymology))
+
+    def sttCallBack(self):
+        try:
+            msg = self.lbtext.selection_get()
+        except TclError:
+            pass
+        try:
+            msg = self.transtxt.selection_get()
+        except TclError:
+            return ""
+
+        TTS.tts('Voice input can begin now')
+        ttsmsg = TTS.stt()
+        if ttsmsg and not ttsmsg['error']:
+            t = ttsmsg['text']
+            if t and msg:
+                self.transtxt.insert(END, 'Orig: {}\n\nYour: {}'.format(msg, t))
+                self.transtxt.insert(END, '\n\n Similarity: {}'.format(SequenceMatcher(None, msg, t).ratio()))
+                #self.transtxt.insert(END, '{}'.format(color_diff(msg, t)))
+            else:
+                self.transtxt.insert(END, 'No original text selected or no voice input captured')
+
+    def TransCallBack(self):
+        try:
+            msg = self.lbtext.selection_get()
+        except TclError:
+            pass
+        try:
+            msg = self.transtxt.selection_get()
+        except TclError:
+            return ""
+        phonetics = ipa.convert(msg)
+        msg_ch = TTS.en2cn(msg)
+        if len(msg) < 20:
+            self.transtxt.insert(END, '{} [{}] : {}'.format(msg, phonetics, msg_ch))
+        else:
+            self.transtxt.insert(END, '{}'.format(msg_ch))
+
+    def GrammarCheckCallBack(self):
+        try:
+            msg = self.lbtext.selection_get()
+        except TclError:
+            pass
+        try:
+            msg = self.transtxt.selection_get()
+        except TclError:
+            return ""
+        phonetics = ipa.convert(msg)
+        matches = tool.check(msg)
+        for i in matches:
+            self.transtxt.insert(END, '{}'.format(i))
+
+
+    def ttsthreadfunc(self):
+        try:
+            msg = self.lbtext.selection_get()
+        except TclError:
+            pass
+        try:
+            msg = self.transtxt.selection_get()
+        except TclError:
+            return ""
+
+        verses = msg.splitlines()
+        for i in range(len(verses)):
+            if len(verses[i]):
+                TTS.tts(verses[i])
+                time.sleep(0.3)
+
+    def TTSCallBack(self):
+        if self.ttsthread and self.ttsthread.isAlive():
+            self.ttsthread.join()
+
+        self.ttsthread = threading.Thread(target=self.ttsthreadfunc, args=())
+        self.ttsthread.start()
+
+    def newwordsAddCallBack(self):
+        try:
+            msg = self.lbtext.selection_get()
+        except TclError:
+            pass
+        try:
+            msg = self.transtxt.selection_get()
+        except TclError:
+            return
+        if msg in self.newwordset:
+            return
+
+        phonetics = ipa.convert(msg)
+        msg_ch = TTS.en2cn(msg)
+        self.vocabularyBook.write("{} [{}] : {}\r\n".format(msg, phonetics, msg_ch))
+        self.vocabularyBook.flush()
+        self.newwordset.add(msg)
+        self.vocabularyBookDirty = 1
+
+
+    def newwordsDisplayCallBack(self):
+        self.vocabularyBookRead.seek(0, 0)
+        content = self.vocabularyBookRead.read()
+        self.transtxt.delete(1.0, END)
+        self.transtxt.insert(END, content)
+        self.transtxt.see(END)
+
+
+    def autocloudfilesync(self):
+        while 1:
+            if self.autosync_stop == 1:
+                break
+
+            self.cloudfilesync()
+            for self.i in range(30):
+                if not self.autosync_stop:
+                    time.sleep(1)
+
+
+    def cloudfilesync(self):
+        if self.notesDirty == 1:
+            self.notesRead.seek(0, 0)
+            content = self.notesRead.read() 
+            self.notesgf.SetContentString(content)
+            self.notesgf.Upload()
+            self.notesDirty = 0
+
+        if self.vocabularyBookDirty == 1:
+            self.vocabularyBookRead.seek(0, 0)
+            content = self.vocabularyBookRead.read() 
+            self.newwordsgf.SetContentString(content)
+            self.newwordsgf.Upload()
+            self.vocabularyBookDirty = 0
+
+        if self.filemd5 not in self.alllastread:
+            self.alllastread[self.filemd5] = self.currentpage
+        elif self.currentpage != int(self.alllastread[self.filemd5]):
+            self.alllastread[self.filemd5] = str(self.currentpage)
+            content = ''
+            for i in self.alllastread:
+                content += (i + ':' + self.alllastread[i] + '\n')
+            self.lastreadgf.SetContentString(content)
+            self.lastreadgf.Upload()
+
+    def showpage(self):
+        if self.filetype == 'pdf':
+            self.lbimage.delete(1.0, END)
+
+            if self.currentpage not in self.fileimages:
+                self.newfilename = os.path.splitext(self.filepath)[0] + "_{0:0=4d}".format(self.currentpage) + '.gif'
+                pdfpage2gif(self.filepath, self.newfilename, self.currentpage)
+                self.fileimages[self.currentpage] = self.newfilename
+                try:
+                    self.t[self.currentpage] = pytesseract.image_to_string(Image.open(self.newfilename).convert('P'), lang='eng')
+                except:
+                    time.sleep(0.5)
+                    self.t[self.currentpage] = pytesseract.image_to_string(Image.open(self.newfilename).convert('P'), lang='eng')
+
+            resizeimg(self.fileimages[self.currentpage])
+            self.p[self.currentpage] = PhotoImage(file=self.fileimages[self.currentpage])
+            self.lbimage.image_create(END, image = self.p[self.currentpage])
+            self.lbimage.insert(END, '\n'*2)
+            self.fillpageend(self.lbimage)
+            self.lbtext.delete(1.0, END)
+            self.lbtext.insert(END, self.t[self.currentpage])
+            self.lbtext.insert(END, '\n'*2)
+            self.fillpageend(self.lbtext)
+
+        if self.filetype == 'txt':
+            content = readrange(self.BookRead, 30 * self.currentpage, 30 * self.currentpage + 30)
+            self.lbtext.delete(1.0, END)
+            self.lbtext.insert(END, content)
+            self.lbtext.insert(END, '\n'*2)
+            self.fillpageend(self.lbtext)
+
+        self.pagelabel.set('{}/{}'.format(self.currentpage+1, self.totalpages))
+
+
+    def prev_page(self):
+        self.direction = -1
+        if self.currentpage > 0:
+            self.currentpage -= 1
+        self.showpage()
+
+    def prepare_pages(self):
+        if self.filetype != 'pdf':
+            return
+        while self.pagetoprepare < self.totalpages - 1:
+            if self.page_thread_stop:
+                break
+
+            # always prepare the next page
+            self.pagetoprepare = self.currentpage + 1
+
+            while self.pagetoprepare in self.fileimages:
+                self.pagetoprepare += 1
+
+            if self.pagetoprepare == self.totalpages - 1:
+                time.sleep(5)
+                continue
+
+            self.newfilename = os.path.splitext(self.filepath)[0] + "_{0:0=4d}".format(self.pagetoprepare) + '.gif'
+            pdfpage2gif(self.filepath, self.newfilename, self.pagetoprepare)
+            self.fileimages[self.pagetoprepare] = self.newfilename
+            try:
+                self.t[self.pagetoprepare] = pytesseract.image_to_string(Image.open(self.newfilename).convert('P'), lang='eng')
+            except:
+                time.sleep(2)
+                self.t[self.pagetoprepare] = pytesseract.image_to_string(Image.open(self.newfilename).convert('P'), lang='eng')
+            self.pagetoprepare += 1
+            #print('self.pagetoprepare {}, self.currentpage {}'.format(self.pagetoprepare, self.currentpage))
+            if self.pagetoprepare - self.currentpage > 10:
+                for self.i in range(30):
+                    if not self.page_thread_stop:
+                        time.sleep(1)
+                    #if self.pagetoprepare - self.currentpage <= 10:
+                    #    break
+                    else:
+                        break
+
+
+    def jump_to_page(self, n):
+        if n <= self.totalpages and n > 0:
+            self.currentpage = n - 1
+        else:
+            return
+
+        if self.filetype == 'pdf':
+            if self.currentpage in self.t and self.currentpage in self.p:
+                self.showpage()
+                return
+            
+            self.newfilename = os.path.splitext(self.filepath)[0] + "_{0:0=4d}".format(self.currentpage) + '.gif'
+            pdfpage2gif(self.filepath, self.newfilename, self.currentpage)
+
+            self.fileimages[self.currentpage] = self.newfilename
+            try:
+                self.t[self.currentpage] = pytesseract.image_to_string(Image.open(self.newfilename).convert('P'), lang='eng')
+            except:
+                time.sleep(1)
+                self.t[self.currentpage] = pytesseract.image_to_string(Image.open(self.newfilename).convert('P'), lang='eng')
+            resizeimg(self.fileimages[self.currentpage])
+            try:
+                self.p[self.currentpage] = PhotoImage(file=self.newfilename)
+            except:
+                time.sleep(1)
+                self.p[self.currentpage] = PhotoImage(file=self.newfilename)
+        self.showpage()
+
+
+    def next_page(self):
+        self.direction = 1
+        if self.currentpage < self.totalpages - 1:
+            self.currentpage += 1
+
+        if self.filetype == 'pdf':
+            i = self.currentpage
+            if self.currentpage in self.t:
+                self.showpage()
+                return
+            
+            newfilename = os.path.splitext(self.filepath)[0] + "_{0:0=4d}".format(i) + '.gif'
+            pdfpage2gif(self.filepath, newfilename, i)
+            self.fileimages[self.currentpage] = newfilename
+            self.t[self.currentpage] = pytesseract.image_to_string(Image.open(self.fileimages[self.currentpage]).convert('P'), lang='eng')
+            resizeimg(self.fileimages[self.currentpage])
+            self.p[self.currentpage] = PhotoImage(file=self.fileimages[self.currentpage])
+        self.showpage()
+
+    def windowExit(self):
+        if messagebox.askokcancel("Quit", "Do you want to quit?"):
+            # Terminate page preprocess thread
+            if self.page_thread and self.page_thread.isAlive():
+                self.page_thread_stop = 1
+                self.page_thread.join(5)
+
+            # Terminate auto cloud file sync thread
+            if settings.google_drv == 1:
+                if self.autosync_thread and self.autosync_thread.isAlive():
+                    self.autosync_stop = 1
+                    self.autosync_thread.join(5)
+
+                # sync up local files to cloud
+                self.cloudfilesync()
+
+            # clean up local files
+            if self.notes:
+                self.notes.seek(0, 0)
+                self.notes.truncate()
+                self.notes.close()
+            if self.notesRead:
+                self.notesRead.close()
+
+            if self.vocabularyBook:
+                self.vocabularyBook.seek(0, 0)
+                self.vocabularyBook.truncate()
+                self.vocabularyBook.close()
+            if self.vocabularyBookRead:
+                self.vocabularyBookRead.close()
+
+            if self.filetype == 'pdf':
+                for f in self.fileimages:
+                    try:
+                        os.remove(self.fileimages[f])
+                    except:
+                        pass
+
+            os.system('find . -name "*.pyc" -exec rm -f {} \;')
+            os.system('rm -r __pycache__')
+
+            sys.exit()
+
+ 
+def main():
+    root = Tk()
+    root.tk.call('wm', 'iconphoto', root._w, PhotoImage(file='symbols/logo.gif'))
+
+    rw = ResizableWindow(root)
+
+    #rw.get_widget_attributes()
+    root.protocol("WM_DELETE_WINDOW", rw.windowExit)
+    root.mainloop()
+ 
+ 
+if __name__ == '__main__':
+    main()
